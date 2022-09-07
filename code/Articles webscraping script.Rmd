@@ -1,0 +1,254 @@
+---
+title: "Google Scholar webscraping script"
+author: "Alberto Agudo Domínguez"
+date: '2022-09-06'
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+library(tidyverse)
+library(RSelenium)
+
+# Avoiding scientific notation
+options(scipen = 9999)
+
+# Shortcut for CSS selector in Selenium:
+css_find <- function(css_selector, one_element = T){
+  
+  if (one_element) {
+    search <- driver$findElement(using = "css", css_selector)
+  } else {
+    search <- driver$findElements(using = "css", css_selector)
+  }
+  return(search)
+}
+```
+
+
+## 1) Set up Webscraping details
+```{r}
+rD <- rsDriver(browser = "firefox")
+driver <- rD$client
+
+# Check that the browser is navigating properly:
+url <- "https://scholar.google.com"
+driver$navigate(url)
+```
+
+
+```{r}
+# Create a list of all CSS selectors:
+css_list <- list()
+
+css_list$search_bar <- "#gs_hdr_tsi"
+css_list$button <- "#gs_hdr_tsb"
+
+css_list$first_title <- ".gs_r > .gs_rt a"
+css_list$titles <- ".gs_rt a"
+css_list$not_first_title <- ".gs_ri .gs_rt a"
+css_list$authors_journal_year <- ".gs_a"
+css_list$abstracts <- ".gs_rs"
+css_list$n_citations <- ".gs_or_btn.gs_nph+ a"
+
+css_list$next_page_button <- "#gs_n > center:nth-child(1) > table:nth-child(1) > tbody:nth-child(1) > tr:nth-child(1) > td:nth-child(12) > a:nth-child(1) > b:nth-child(2)" 
+css_list$last_page <- "td:nth-child(11) a"
+css_list$final_page_nr <- "#gs_n > center:nth-child(1) > table:nth-child(1) > tbody:nth-child(1) > tr:nth-child(1) > td:nth-child(11) > b:nth-child(2)"
+
+css_list$server_error <- "#gs_top > h1:nth-child(10)"
+```
+
+
+
+## 2) Set up table to collect the data
+
+```{r}
+search_df <- data.frame(title = character(),
+                        author_journal = character(),
+                        abstract = character(),
+                        n_citations = integer())
+```
+
+
+## 3) Webscraping process
+
+*Note: If the name of the topic that the user wants to search also appears as a user profile, this might cause inaccuracies since user profiles appear as another entry (as if Google Scholar was displaying a new paper). To avoid this, our script changes the default search engine language to English and then detects when the first entry is "User Profiles".*
+
+*The script should start running from the URL we provided above (the general Google Scholar search box).*
+
+*Note: The script requires the user to be alert, since sometimes a "Are you a robot" message pops up. Then the search should be stopped and reset at the page where it stopped.*
+
+```{r}
+topic <- "intergenerational mobility"
+
+url <- "https://scholar.google.com"
+driver$navigate(url)
+Sys.sleep(2)
+
+# Search title
+search_bar <- css_find(css_list$search_bar)
+search_bar$sendKeysToElement(list(topic))
+
+Sys.sleep(1)
+
+button <- css_find(css_list$button)
+button$clickElement()
+
+Sys.sleep(2)
+
+# If the user wants to search for a particular time range, they may specify it on
+# the advanced search bar of the left and run the script from this point.
+
+# Check that the language is English (it appears in the URL after "hl="XX)
+# Otherwise, change language to English
+first_page_url <- driver$getCurrentUrl()[[1]]
+lang <- str_match(first_page_url, r"{hl=(\w{2,})}")[2]
+if (lang != "en"){
+  first_page_url <- gsub(r"{hl=(\w{2,})}", r"{hl=en}", first_page_url)
+  driver$navigate(first_page_url)
+}
+
+# Find last page, click last page, repeat until last page does not change after clicking
+# Save number of total pages
+# Then come back to the beginning page
+last_page_before <- css_find(css_list$last_page)
+last_page_before_nr <- as.integer(last_page_before$getElementText()[[1]])
+last_page_before$clickElement()
+
+Sys.sleep(2)
+
+last_page_after <- css_find(css_list$last_page)
+last_page_after_nr <- as.integer(last_page_after$getElementText()[[1]])
+
+while(last_page_after_nr != last_page_before_nr){
+  # Handle the possible error of the final page
+  tryCatch(suppressMessages(last_page_before <- css_find(css_list$last_page)),
+           error = function(e){last_page_before <<- css_find(css_list$final_page_nr)})
+  last_page_before_nr <- as.integer(last_page_before$getElementText()[[1]])
+  last_page_before$clickElement()
+  
+  Sys.sleep(3)
+  
+  tryCatch(suppressMessages(last_page_after <- css_find(css_list$last_page)),
+           error = function(e){last_page_after <<- css_find(css_list$final_page_nr)})
+  last_page_after_nr <- as.integer(last_page_after$getElementText()[[1]])
+  
+  # Handle one type of server error (pages 99 and 100 do not print)
+  if ((last_page_after_nr == 100) & (last_page_before_nr == 98)){
+    before_click_url <- driver$getCurrentUrl()[[1]]
+    
+    # Try clicking the new page, if there is a server error determine that
+    # the last page to search for is 98
+    suppressMessages(last_page_after$clickElement())
+    
+    # Set as last page the last one before error (and the while loop would finish)
+    tryCatch(suppressMessages({server <- css_find(css_list$server_error)
+                               last_page_after_nr <- last_page_before_nr},
+             error <- function(e){driver$navigate(before_click_url)}))
+  }
+}
+
+driver$navigate(first_page_url)
+
+Sys.sleep(2)
+
+# Now loop until you finish all pages
+for (page_nr in 1:last_page_after_nr){
+  
+  # Get all titles:
+  titles_obj <- css_find(css_list$titles, one_element = F)
+  titles <- sapply(titles_obj, function(x) x$getElementText()[[1]])
+  
+  # Check for User profiles entry in the first page:
+  if (page_nr == 1){
+  
+  profiles <- sapply(titles, function(x) startsWith(x, "User profiles"))
+  
+  if (sum(profiles) > 0){
+    location <- which(profiles)
+    titles <- titles[-location]
+    }
+  }
+  
+  # All authors + journal + year of publication:
+  author_journal_obj <- css_find(css_list$authors_journal_year, one_element = F)
+  author_journal <- sapply(author_journal_obj, function(x) x$getElementText()[[1]])
+
+  # Abstract:
+  abstracts_obj <- css_find(css_list$abstracts, one_element = F)
+  abstracts <- sapply(abstracts_obj, function(x) x$getElementText()[[1]])
+  
+  # Citations:
+  citations_obj <- css_find(css_list$n_citations, one_element = F)
+  n_citations <- sapply(citations_obj, function(x) {text <- x$getElementText()[[1]]
+                                                    return(str_match(text,
+                                                                     r"{Cited by ([0-9]+)}")[2])})
+  
+  # Create a DataFrame with all information from this page and append it to our
+  # original DF
+  page_info <- cbind(titles, author_journal, abstracts, n_citations)
+  
+  search_df <- rbind(search_df, page_info)
+  
+  
+  # Click next page button:
+  try(suppressMessages({next_page_button <- css_find(css_list$next_page_button)
+      next_page_button$clickElement()}),
+      silent = T)
+  
+  print(paste("Completed page", page_nr, "/", last_page_after_nr))
+  
+  Sys.sleep(2)
+}
+
+
+```
+
+
+```{r}
+# Check for duplicates:
+sum(duplicated(search_df))
+
+# Get cleaner info on authors, journal of publication, year of publication
+# and webpage.
+author_journalyear_page <- str_split(search_df$author_journal, " - ")
+
+get_year <- function(vector){
+  journal_year <- sapply(vector, function(x) x[2])
+  years <- sapply(journal_year, function(x) as.integer(str_match(x, "(, )?([0-9]+)")[3]))
+  return(years)
+}
+
+get_journal <- function(vector){
+  journal_year <- sapply(vector, function(x) x[2])
+  journal <- sapply(journal_year, function(x) gsub("(, )?([0-9]+)", "", x))
+  return(journal)
+  
+}
+
+search_df$author <- sapply(author_journalyear_page, function(x) x[1])
+search_df$journal <- get_journal(author_journalyear_page)
+search_df$year <- get_year(author_journalyear_page)
+search_df$page <- sapply(author_journalyear_page, function(x) x[3])
+
+search_df
+```
+
+
+
+## 4) Save
+
+```{r}
+write_csv(search_df, "../data/search_df.csv")
+```
+
+
+```{r}
+# Close the driver:
+driver$close()
+rD$server$stop()
+```
+
